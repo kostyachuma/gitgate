@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+"""gitgate: git smart-HTTP прокси, который подставляет токен GitHub и фильтрует push.
+
+Клиент (агент) ходит на http://gitgate:8080/<owner>/<repo>.git без учётных данных.
+- fetch (info/refs, git-upload-pack): пропускается для разрешённых репозиториев.
+- push (git-receive-pack): пропускается, только если ВСЕ обновляемые ссылки
+  подходят под GITGATE_REF_REGEX (по умолчанию refs/heads/hermes/...).
+- всё остальное: 403/404.
+
+Настройки (переменные окружения):
+  GITGATE_TOKEN или GITGATE_TOKEN_FILE   токен GitHub (обязателен)
+  GITGATE_ALLOW                          маски owner/repo через запятую, например "kostyachuma/*"
+                                         (пусто = всё запрещено)
+  GITGATE_REF_REGEX                      разрешённые ссылки для push
+  GITGATE_PORT                           порт (8080)
+  GITGATE_UPSTREAM, GITGATE_SCHEME       github.com / https (меняются только в тестах)
+
+Только стандартная библиотека. Токен и заголовки никогда не пишутся в лог.
+"""
+import base64
+import fnmatch
+import http.client
+import os
+import re
+import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+ZERO = "0" * 40
+PATH_RE = re.compile(
+    r"^/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+?)(?:\.git)?/(info/refs|git-upload-pack|git-receive-pack)$"
+)
+FORWARD_REQ_HEADERS = ("Content-Type", "Accept", "Content-Encoding", "Git-Protocol", "User-Agent")
+FORWARD_RESP_HEADERS = ("Content-Type", "Cache-Control", "Expires", "Pragma")
+
+
+class Reject(Exception):
+    pass
+
+
+class Config:
+    def __init__(self, env=os.environ):
+        token = env.get("GITGATE_TOKEN", "")
+        tfile = env.get("GITGATE_TOKEN_FILE")
+        if not token and tfile:
+            with open(tfile) as f:
+                token = f.read().strip()
+        self.token = token
+        self.allow = [p.strip() for p in env.get("GITGATE_ALLOW", "").split(",") if p.strip()]
+        self.ref_re = re.compile(env.get("GITGATE_REF_REGEX", r"^refs/heads/hermes/[A-Za-z0-9._/-]+$"))
+        self.ref_hint = env.get("GITGATE_REF_HINT", "refs/heads/hermes/*")
+        self.upstream = env.get("GITGATE_UPSTREAM", "github.com")
+        self.scheme = env.get("GITGATE_SCHEME", "https")
+        self.port = int(env.get("GITGATE_PORT", "8080"))
+
+    def repo_allowed(self, owner, repo):
+        name = f"{owner}/{repo}"
+        return any(fnmatch.fnmatchcase(name, p) for p in self.allow)
+
+    def auth_header(self):
+        raw = f"x-access-token:{self.token}".encode()
+        return "Basic " + base64.b64encode(raw).decode()
+
+
+# ---- разбор push-команд -------------------------------------------------
+
+def parse_commands(read):
+    """read(n) возвращает ровно n байт. Читает pkt-line команды до flush ('0000').
+    Возвращает (сырые байты, [(old, new, ref), ...], capabilities клиента)."""
+    raw = b""
+    cmds = []
+    caps = set()
+    while True:
+        hdr = read(4)
+        raw += hdr
+        if not re.fullmatch(rb"[0-9a-f]{4}", hdr):
+            raise Reject("bad pkt-line header")
+        n = int(hdr, 16)
+        if n == 0:
+            return raw, cmds, caps
+        if n < 4 or n > 65520:
+            raise Reject("bad pkt-line length")
+        payload = read(n - 4)
+        raw += payload
+        head, _, capstr = payload.partition(b"\0")
+        line = head.rstrip(b"\n").decode("utf-8", "replace")
+        if line.startswith("shallow "):
+            continue
+        if line.startswith("push-cert"):
+            raise Reject("push certificates are not allowed")
+        m = re.fullmatch(r"([0-9a-f]{40}) ([0-9a-f]{40}) (\S+)", line)
+        if not m:
+            raise Reject("bad push command")
+        if not cmds:
+            caps = set(capstr.split())
+        cmds.append((m.group(1), m.group(2), m.group(3)))
+
+
+def bad_refs(cmds, ref_re):
+    return [ref for _, _, ref in cmds
+            if not ref_re.match(ref) or ".." in ref or "//" in ref or ref.endswith("/") or ref.endswith(".lock")]
+
+
+def check_commands(cmds, ref_re, hint="refs/heads/hermes/*"):
+    if not cmds:
+        raise Reject("no ref updates in push")
+    bad = bad_refs(cmds, ref_re)
+    if bad:
+        raise Reject(f"push allowed only to {hint}; rejected: " + ", ".join(bad))
+
+
+def pkt(data):
+    return b"%04x" % (len(data) + 4) + data
+
+
+def push_rejection(cmds, caps, bad, hint="refs/heads/hermes/*"):
+    """Ответ receive-pack, который git показывает как «remote rejected» с причиной.
+    None, если клиент не просил report-status (тогда отвечаем обычным 403)."""
+    if b"report-status" not in caps and b"report-status-v2" not in caps:
+        return None
+    report = pkt(b"unpack ok\n")
+    for _, _, ref in cmds:
+        why = (f"gitgate: only {hint} can be pushed" if ref in bad
+               else "gitgate: not applied, another ref in this push was rejected")
+        report += pkt(f"ng {ref} {why}\n".encode())
+    report += b"0000"
+    if b"side-band-64k" in caps or b"side-band" in caps:
+        msg = f"gitgate: push rejected, only {hint} can be pushed\n".encode()
+        return pkt(b"\x02" + msg) + pkt(b"\x01" + report) + b"0000"
+    return report
+
+
+MAX_DRAIN = 256 * 1024 * 1024  # сколько отвергнутого push дочитываем, чтобы клиент увидел ответ
+
+
+class Body:
+    """Тело HTTP-запроса: Content-Length или chunked."""
+
+    def __init__(self, rfile, headers):
+        self.rfile = rfile
+        self.chunked = headers.get("Transfer-Encoding", "").lower() == "chunked"
+        self.left = int(headers.get("Content-Length") or 0)
+        self.cur = 0
+        self.done = not self.chunked and self.left == 0
+
+    def read_some(self, n=65536):
+        if self.done:
+            return b""
+        if not self.chunked:
+            data = self.rfile.read(min(n, self.left))
+            self.left -= len(data)
+            if not data or self.left == 0:
+                self.done = True
+            return data
+        if self.cur == 0:
+            size = int(self.rfile.readline().split(b";")[0].strip() or b"0", 16)
+            if size == 0:
+                while self.rfile.readline().strip():
+                    pass
+                self.done = True
+                return b""
+            self.cur = size
+        data = self.rfile.read(min(n, self.cur))
+        self.cur -= len(data)
+        if self.cur == 0:
+            self.rfile.readline()
+        return data
+
+    def read(self, n):
+        out = b""
+        while len(out) < n:
+            part = self.read_some(n - len(out))
+            if not part:
+                raise Reject("truncated request body")
+            out += part
+        return out
+
+    def rest(self):
+        while True:
+            part = self.read_some()
+            if not part:
+                return
+            yield part
+
+
+# ---- HTTP-обработчик ----------------------------------------------------
+
+def make_handler(cfg):
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        server_version = "gitgate"
+
+        def log_message(self, fmt, *args):
+            sys.stderr.write("gitgate: " + (fmt % args) + "\n")
+
+        def deny(self, code, msg):
+            data = (msg + "\n").encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(data)
+            self.close_connection = True
+            self.log_message("DENY %s %s: %s", self.command, self.path.split("?")[0], msg)
+
+        def do_GET(self):
+            self.handle_git()
+
+        def do_POST(self):
+            self.handle_git()
+
+        def handle_git(self):
+            path, _, query = self.path.partition("?")
+            m = PATH_RE.match(path)
+            if not m:
+                return self.deny(404, "not a git endpoint")
+            owner, repo, what = m.groups()
+            if not cfg.repo_allowed(owner, repo):
+                return self.deny(403, f"repository {owner}/{repo} is not allowed")
+            is_push = what == "git-receive-pack" or (what == "info/refs" and "service=git-receive-pack" in query)
+            if what == "info/refs":
+                if self.command != "GET" or not re.fullmatch(r"service=git-(upload|receive)-pack", query):
+                    return self.deny(403, "only smart HTTP is supported")
+            elif self.command != "POST":
+                return self.deny(405, "POST required")
+
+            body = None
+            prefix = b""
+            if self.command == "POST":
+                body = Body(self.rfile, self.headers)
+                if what == "git-receive-pack":
+                    if self.headers.get("Content-Encoding"):
+                        return self.deny(403, "encoded push bodies are not allowed")
+                    cmds = []
+                    try:
+                        prefix, cmds, caps = parse_commands(body.read)
+                        if cmds:
+                            check_commands(cmds, cfg.ref_re, cfg.ref_hint)
+                        elif body.read_some():
+                            raise Reject("no ref updates in push")
+                        # пустой запрос из одного flush: так git проверяет доступ перед push больше 1 МБ
+                    except Reject as e:
+                        if cmds and bad_refs(cmds, cfg.ref_re):
+                            return self.reject_push(body, cmds, caps, str(e))
+                        return self.deny(403, str(e))
+                    self.log_message("PUSH %s/%s %s", owner, repo, " ".join(c[2] for c in cmds) or "(probe)")
+                else:
+                    self.log_message("FETCH %s/%s", owner, repo)
+            else:
+                self.log_message("%s %s/%s", "INFO-PUSH" if is_push else "INFO-FETCH", owner, repo)
+
+            self.forward(owner, repo, what, query, body, prefix)
+
+        def reject_push(self, body, cmds, caps, reason):
+            out = push_rejection(cmds, caps, bad_refs(cmds, cfg.ref_re), cfg.ref_hint)
+            if out is None:
+                return self.deny(403, reason)
+            try:
+                drained = 0
+                for part in body.rest():
+                    drained += len(part)
+                    if drained > MAX_DRAIN:
+                        break
+            except OSError:
+                pass
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-git-receive-pack-result")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Content-Length", str(len(out)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(out)
+            self.close_connection = True
+            self.log_message("DENY PUSH %s: %s", self.path.split("?")[0], reason)
+
+        def forward(self, owner, repo, what, query, body, prefix):
+            upath = f"/{owner}/{repo}.git/{what}" + ("?" + query if query else "")
+            headers = {"Authorization": cfg.auth_header()}
+            for h in FORWARD_REQ_HEADERS:
+                if self.headers.get(h):
+                    headers[h] = self.headers[h]
+            conn_cls = http.client.HTTPSConnection if cfg.scheme == "https" else http.client.HTTPConnection
+            conn = conn_cls(cfg.upstream, timeout=600)
+            try:
+                if body is None:
+                    conn.request("GET", upath, headers=headers)
+                else:
+                    def gen():
+                        if prefix:
+                            yield prefix
+                        yield from body.rest()
+                    headers["Transfer-Encoding"] = "chunked"
+                    conn.request("POST", upath, body=gen(), headers=headers, encode_chunked=True)
+                resp = conn.getresponse()
+                self.send_response(resp.status)
+                for h in FORWARD_RESP_HEADERS:
+                    if resp.getheader(h):
+                        self.send_header(h, resp.getheader(h))
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                while True:
+                    chunk = resp.read1(16384)
+                    if not chunk:
+                        break
+                    self.wfile.write(b"%x\r\n" % len(chunk) + chunk + b"\r\n")
+                self.wfile.write(b"0\r\n\r\n")
+            except (OSError, http.client.HTTPException) as e:
+                self.log_message("UPSTREAM ERROR %s", type(e).__name__)
+                self.close_connection = True
+            finally:
+                conn.close()
+
+    return Handler
+
+
+def main():
+    cfg = Config()
+    if not cfg.token:
+        sys.exit("gitgate: GITGATE_TOKEN or GITGATE_TOKEN_FILE is required")
+    if not cfg.allow:
+        sys.stderr.write("gitgate: GITGATE_ALLOW is empty, every repository will be denied\n")
+    srv = ThreadingHTTPServer(("0.0.0.0", cfg.port), make_handler(cfg))
+    srv.daemon_threads = True
+    sys.stderr.write(f"gitgate: listening on :{cfg.port}, allow={cfg.allow}, refs={cfg.ref_re.pattern}\n")
+    srv.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

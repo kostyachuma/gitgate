@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+# секреты никогда не коммитим
+token
+*.token
+.env
+repos.conf
