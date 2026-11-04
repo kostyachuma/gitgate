@@ -1,6 +1,6 @@
 # gitgate
 
-A tiny git proxy for GitHub (Python standard library only) that sits between an AI agent and GitHub.
+A small git proxy for GitHub (Python standard library only) that sits between an AI agent and GitHub.
 The agent never sees the GitHub token; the proxy holds it and decides what may be pushed.
 
 - **fetch / clone** works for repositories matching `GITGATE_ALLOW` (e.g. `myorg/*`).
@@ -61,7 +61,6 @@ Use a GitHub fine-grained personal access token with Contents and Pull requests 
 | `GITGATE_TOKEN` or `GITGATE_TOKEN_FILE` | GitHub token (required) |
 | `GITGATE_ALLOW` | Comma-separated `owner/repo` globs. Empty denies everything. |
 | `GITGATE_BRANCH_PREFIX` | Branches the agent may push must start with this. Default: `agent/` |
-| `GITGATE_REF_REGEX`, `GITGATE_REF_HINT` | Advanced: a full regex and rejection text instead of the prefix |
 | `GITGATE_POLICY_FILE` or `GITGATE_POLICY` | Optional TOML policy: several tokens, rules and named agents (below) |
 | `GITGATE_ENABLE_PR` | `1` enables `POST /<owner>/<repo>.git/pulls`. Default: off. |
 | `GITGATE_PR_BASES` | Comma-separated base branches a PR may target. Default: `main` |
@@ -69,10 +68,10 @@ Use a GitHub fine-grained personal access token with Contents and Pull requests 
 
 ## Deploy on Coolify
 
-1. `python3 coolify/make_compose.py > coolify/docker-compose.yaml` (after any change to `gitgate.py`).
+1. `python3 coolify/make_compose.py > coolify/docker-compose.yaml` (after any change in `proxy/`).
 2. In Coolify: New Resource, Docker Compose (empty), paste the file.
-3. Set `GITGATE_TOKEN` (secret), `GITGATE_ALLOW`, optionally `GITGATE_BRANCH_PREFIX`, `GITGATE_ENABLE_PR=1`, and `GITGATE_NETWORK` (the existing Docker network
-   your agent containers are on). Do not assign a domain.
+3. Set `GITGATE_TOKEN` (secret), `GITGATE_ALLOW`, optionally `GITGATE_BRANCH_PREFIX` and `GITGATE_ENABLE_PR=1`,
+   and `GITGATE_NETWORK` (the existing Docker network your agent containers are on). Do not assign a domain.
 4. From the agent's containers the proxy is reachable as `http://gitgate:8080`.
 
 ## Several repositories, tokens and agents (optional)
@@ -162,14 +161,13 @@ uses to sign the JWT (Python's standard library has no RSA). The private key is 
 as sensitive as a personal token. If GitHub or the App is unavailable, gitgate answers 502 and sends nothing upstream.
 
 On Coolify only variables listed in the compose file reach the container. If your policy refers to
-`TOKEN_MYORG` or `KEY_ALICE`, add `- TOKEN_MYORG=${TOKEN_MYORG}` etc. to the `environment:` list in
-`coolify/make_compose.py` and regenerate the compose file.
+`TOKEN_MYORG` or `KEY_ALICE`, add these names to `ENVIRONMENT` in `coolify/make_compose.py` and
+regenerate the compose file.
 
 ## Using it with Hermes
 
-Hermes names the branches it creates for worktrees
-`hermes/<id>`. The default prefix is `agent/`, so a Hermes push would be rejected. Tell gitgate to accept
-Hermes' prefix instead:
+Hermes names the branches it creates for worktrees `hermes/<id>`. The default prefix is `agent/`, so a Hermes
+push would be rejected. Tell gitgate to accept Hermes' prefix instead:
 
 ```
 GITGATE_BRANCH_PREFIX=hermes/
@@ -182,9 +180,11 @@ The same approach works for any other agent: set the prefix to whatever it uses 
 ## Tests
 
 ```bash
-cd proxy && python3 -I -m unittest   # unit tests and end-to-end tests with a fake upstream
-python3 proxy/e2e_realgit.py         # real git against a fake GitHub
+cd proxy && python3 -I -m unittest
 ```
+
+Unit tests, end-to-end tests against a fake GitHub, and (when `git` is installed) real `git push` runs through
+the proxy. Needs Python 3.11+ and, for the GitHub App tests, `openssl`.
 
 ## Limitations
 

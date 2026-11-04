@@ -4,4 +4,4 @@ __pycache__/
 token
 *.token
 .env
-repos.conf
+*.pem
