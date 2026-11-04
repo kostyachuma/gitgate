@@ -1,5 +1,5 @@
 FROM python:3.13-alpine
-RUN adduser -D -u 10001 gitgate
+RUN apk add --no-cache openssl && adduser -D -u 10001 gitgate
 COPY gitgate.py /app/gitgate.py
 USER gitgate
 EXPOSE 8080

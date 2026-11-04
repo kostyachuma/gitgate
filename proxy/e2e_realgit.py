@@ -41,12 +41,22 @@ class Up(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(out))); self.end_headers(); self.wfile.write(out)
 
 up = ThreadingHTTPServer(("127.0.0.1", 0), Up)
-cfg = gitgate.Config({"GITGATE_TOKEN": "x", "GITGATE_ALLOW": "me/*", "GITGATE_SCHEME": "http",
+POLICY = """
+[[client]]
+name = "bot"
+key_env = "BOT_KEY"
+[[rule]]
+repos = ["me/*"]
+clients = ["bot"]
+"""
+cfg = gitgate.Config({"GITGATE_TOKEN": "x", "GITGATE_POLICY": POLICY, "BOT_KEY": "secret", "GITGATE_SCHEME": "http",
                       "GITGATE_UPSTREAM": f"127.0.0.1:{up.server_port}"})
 gate = ThreadingHTTPServer(("127.0.0.1", 0), gitgate.make_handler(cfg))
 for s in (up, gate): threading.Thread(target=s.serve_forever, daemon=True).start()
-url = f"http://127.0.0.1:{gate.server_port}/me/app.git"
+url = f"http://bot:secret@127.0.0.1:{gate.server_port}/me/app.git"
 git("remote", "add", "gate", url, cwd=work)
+git("remote", "add", "badkey", f"http://bot:wrong@127.0.0.1:{gate.server_port}/me/app.git", cwd=work)
+git("remote", "add", "nokey", f"http://127.0.0.1:{gate.server_port}/me/app.git", cwd=work)
 git("commit", "-q", "--allow-empty", "-m", "work", cwd=work)
 big = os.path.join(work, "big.bin"); open(big, "wb").write(os.urandom(3_000_000))
 git("add", "big.bin", cwd=work); git("commit", "-q", "-m", "big", cwd=work)
@@ -55,9 +65,11 @@ def run(title, *args):
     r = git(*args, cwd=work, check=False)
     print(f"### {title}  (rc={r.returncode})")
     print("\n".join("   " + l for l in (r.stdout + r.stderr).strip().splitlines() if "gitgate:" not in l.split(" ")[0] or True))
-run("hermes/ok (expect success, 3 MB pack)", "push", "gate", "HEAD:refs/heads/hermes/ok")
+run("wrong client key (expect failure)", "push", "badkey", "HEAD:refs/heads/agent/nope")
+run("no client key (expect failure)", "push", "nokey", "HEAD:refs/heads/agent/nope")
+run("agent/ok (expect success, 3 MB pack)", "push", "gate", "HEAD:refs/heads/agent/ok")
 run("main (expect a clear rejection)", "push", "gate", "HEAD:refs/heads/main")
-run("agent/x", "push", "gate", "HEAD:refs/heads/agent/x")
-run("hermes/two + main in one push", "push", "gate", "HEAD:refs/heads/hermes/two", "HEAD:refs/heads/main")
+run("bot/x (other prefix)", "push", "gate", "HEAD:refs/heads/bot/x")
+run("agent/two + main in one push", "push", "gate", "HEAD:refs/heads/agent/two", "HEAD:refs/heads/main")
 git("tag", "v1", cwd=work); run("tag", "push", "gate", "v1")
 print("### refs in upstream:", git("for-each-ref", "--format=%(refname)", cwd=bare).stdout.split())

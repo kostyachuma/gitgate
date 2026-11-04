@@ -24,7 +24,7 @@ services:
       context: .
       dockerfile_inline: |
         FROM python:3.13-alpine
-        RUN adduser -D -u 10001 gitgate
+        RUN apk add --no-cache openssl && adduser -D -u 10001 gitgate
         COPY <<'PYEOF' /app/gitgate.py
 """
 TAIL = """
@@ -35,6 +35,10 @@ TAIL = """
     environment:
       - GITGATE_TOKEN=${GITGATE_TOKEN}
       - GITGATE_ALLOW=${GITGATE_ALLOW}
+      - GITGATE_BRANCH_PREFIX=${GITGATE_BRANCH_PREFIX}
+      - GITGATE_POLICY=${GITGATE_POLICY}
+      - GITGATE_ENABLE_PR=${GITGATE_ENABLE_PR}
+      - GITGATE_PR_BASES=${GITGATE_PR_BASES}
     healthcheck:
       test: ["CMD", "python3", "-c", "import socket; socket.create_connection(('127.0.0.1', 8080), 2)"]
       interval: 30s
