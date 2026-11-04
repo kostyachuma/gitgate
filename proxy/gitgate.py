@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
-"""gitgate: git smart-HTTP прокси, который подставляет токен GitHub и фильтрует push.
+"""gitgate: a git smart-HTTP proxy that injects a GitHub token and filters pushes.
 
-Клиент (агент) ходит на http://gitgate:8080/<owner>/<repo>.git без учётных данных.
-- fetch (info/refs, git-upload-pack): пропускается для разрешённых репозиториев.
-- push (git-receive-pack): пропускается, только если ВСЕ обновляемые ссылки
-  подходят под GITGATE_REF_REGEX (по умолчанию refs/heads/hermes/...).
-- всё остальное: 403/404.
+The client (e.g. an AI agent) talks to http://gitgate:8080/<owner>/<repo>.git with no credentials.
+- fetch (info/refs, git-upload-pack): allowed for repositories matching GITGATE_ALLOW.
+- push (git-receive-pack): allowed only if ALL updated refs match GITGATE_REF_REGEX
+  (default: refs/heads/hermes/...).
+- everything else: 403/404.
 
-Настройки (переменные окружения):
-  GITGATE_TOKEN или GITGATE_TOKEN_FILE   токен GitHub (обязателен)
-  GITGATE_ALLOW                          маски owner/repo через запятую, например "kostyachuma/*"
-                                         (пусто = всё запрещено)
-  GITGATE_REF_REGEX                      разрешённые ссылки для push
-  GITGATE_PORT                           порт (8080)
-  GITGATE_UPSTREAM, GITGATE_SCHEME       github.com / https (меняются только в тестах)
+Settings (environment variables):
+  GITGATE_TOKEN or GITGATE_TOKEN_FILE   GitHub token (required)
+  GITGATE_ALLOW                          comma-separated owner/repo globs, e.g. "myorg/*"
+                                         (empty = deny everything)
+  GITGATE_REF_REGEX                      refs that may be pushed
+  GITGATE_REF_HINT                       human-readable hint shown in rejections
+  GITGATE_PORT                           listen port (8080)
+  GITGATE_UPSTREAM, GITGATE_SCHEME       github.com / https (only changed in tests)
 
-Только стандартная библиотека. Токен и заголовки никогда не пишутся в лог.
+Standard library only. The token and request headers are never logged.
 """
 import base64
 import fnmatch
@@ -61,11 +62,11 @@ class Config:
         return "Basic " + base64.b64encode(raw).decode()
 
 
-# ---- разбор push-команд -------------------------------------------------
+# ---- push command parsing -----------------------------------------------------
 
 def parse_commands(read):
-    """read(n) возвращает ровно n байт. Читает pkt-line команды до flush ('0000').
-    Возвращает (сырые байты, [(old, new, ref), ...], capabilities клиента)."""
+    """read(n) must return exactly n bytes. Reads pkt-line commands up to the flush ('0000').
+    Returns (raw bytes, [(old, new, ref), ...], client capabilities)."""
     raw = b""
     cmds = []
     caps = set()
@@ -113,8 +114,8 @@ def pkt(data):
 
 
 def push_rejection(cmds, caps, bad, hint="refs/heads/hermes/*"):
-    """Ответ receive-pack, который git показывает как «remote rejected» с причиной.
-    None, если клиент не просил report-status (тогда отвечаем обычным 403)."""
+    """A receive-pack response that git shows as "remote rejected" with a reason.
+    None if the client did not ask for report-status (then a plain 403 is sent)."""
     if b"report-status" not in caps and b"report-status-v2" not in caps:
         return None
     report = pkt(b"unpack ok\n")
@@ -129,11 +130,11 @@ def push_rejection(cmds, caps, bad, hint="refs/heads/hermes/*"):
     return report
 
 
-MAX_DRAIN = 256 * 1024 * 1024  # сколько отвергнутого push дочитываем, чтобы клиент увидел ответ
+MAX_DRAIN = 256 * 1024 * 1024  # how much of a rejected push we drain so the client can read the response
 
 
 class Body:
-    """Тело HTTP-запроса: Content-Length или chunked."""
+    """HTTP request body: Content-Length or chunked."""
 
     def __init__(self, rfile, headers):
         self.rfile = rfile
@@ -182,7 +183,7 @@ class Body:
             yield part
 
 
-# ---- HTTP-обработчик ----------------------------------------------------
+# ---- HTTP handler -------------------------------------------------------
 
 def make_handler(cfg):
     class Handler(BaseHTTPRequestHandler):
@@ -238,7 +239,7 @@ def make_handler(cfg):
                             check_commands(cmds, cfg.ref_re, cfg.ref_hint)
                         elif body.read_some():
                             raise Reject("no ref updates in push")
-                        # пустой запрос из одного flush: так git проверяет доступ перед push больше 1 МБ
+                        # an empty request (a single flush): git probes access this way before pushes over 1 MB
                     except Reject as e:
                         if cmds and bad_refs(cmds, cfg.ref_re):
                             return self.reject_push(body, cmds, caps, str(e))

@@ -1,5 +1,5 @@
-"""Проверка gitgate настоящим git: поддельный GitHub (git receive-pack на локальном bare-репозитории).
-Запуск: python3 proxy/e2e_realgit.py. Нужен только git. Временный каталог в /tmp можно удалить после."""
+"""Check gitgate with real git against a fake GitHub (git receive-pack on a local bare repository).
+Run: python3 proxy/e2e_realgit.py. Needs only git. The temp directory under /tmp can be deleted afterwards."""
 import os, subprocess, sys, tempfile, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -55,9 +55,9 @@ def run(title, *args):
     r = git(*args, cwd=work, check=False)
     print(f"### {title}  (rc={r.returncode})")
     print("\n".join("   " + l for l in (r.stdout + r.stderr).strip().splitlines() if "gitgate:" not in l.split(" ")[0] or True))
-run("hermes/ok (ждём успех, 3 МБ pack)", "push", "gate", "HEAD:refs/heads/hermes/ok")
-run("main (ждём понятный отказ)", "push", "gate", "HEAD:refs/heads/main")
+run("hermes/ok (expect success, 3 MB pack)", "push", "gate", "HEAD:refs/heads/hermes/ok")
+run("main (expect a clear rejection)", "push", "gate", "HEAD:refs/heads/main")
 run("agent/x", "push", "gate", "HEAD:refs/heads/agent/x")
-run("hermes/two + main в одном push", "push", "gate", "HEAD:refs/heads/hermes/two", "HEAD:refs/heads/main")
-git("tag", "v1", cwd=work); run("тег", "push", "gate", "v1")
-print("### refs в upstream:", git("for-each-ref", "--format=%(refname)", cwd=bare).stdout.split())
+run("hermes/two + main in one push", "push", "gate", "HEAD:refs/heads/hermes/two", "HEAD:refs/heads/main")
+git("tag", "v1", cwd=work); run("tag", "push", "gate", "v1")
+print("### refs in upstream:", git("for-each-ref", "--format=%(refname)", cwd=bare).stdout.split())

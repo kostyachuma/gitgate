@@ -1,6 +1,6 @@
 __pycache__/
 *.pyc
-# секреты никогда не коммитим
+# never commit secrets
 token
 *.token
 .env

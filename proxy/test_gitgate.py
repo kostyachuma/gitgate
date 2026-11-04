@@ -95,7 +95,7 @@ class ParseTests(unittest.TestCase):
 
 
 class EndToEnd(unittest.TestCase):
-    """Поддельный upstream: запоминает запрос и отвечает фиксированно."""
+    """Fake upstream: records the request and replies with a fixed response."""
 
     @classmethod
     def setUpClass(cls):
@@ -168,7 +168,7 @@ class EndToEnd(unittest.TestCase):
     def test_push_main_denied_and_not_forwarded(self):
         self.seen.clear()
         st, data = self.req("POST", "/me/app.git/git-receive-pack", push_body("refs/heads/main"))
-        self.assertEqual(st, 200)  # отказ приходит как report-status, чтобы git показал причину
+        self.assertEqual(st, 200)  # the rejection arrives as report-status so git can show the reason
         self.assertIn(b"ng refs/heads/main gitgate:", data)
         self.assertEqual(self.seen, [])
 
@@ -180,7 +180,7 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(self.seen, [])
 
     def test_probe_request_is_forwarded(self):
-        # git шлёт «0000» перед push больше http.postBuffer, чтобы проверить доступ
+        # git sends "0000" before a push larger than http.postBuffer to check access
         self.seen.clear()
         st, _ = self.req("POST", "/me/app.git/git-receive-pack", b"0000",
                          {"Content-Type": "application/x-git-receive-pack-request"})
