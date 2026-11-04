@@ -78,8 +78,18 @@ After changes in `proxy/`, or to pass extra variables (e.g. `TOKEN_MYORG`, add t
 in [make_compose.py](coolify/make_compose.py)), regenerate the file:
 `python3 coolify/make_compose.py > coolify/docker-compose.yaml`.
 
-**Hermes** names its worktree branches `hermes/<id>`, so set `GITGATE_BRANCH_PREFIX=hermes/`. Use the same approach
-for any other agent's prefix.
+## Using it with Hermes
+
+Hermes names its worktree branches `hermes/<id>`, but the default prefix is `agent/`, so its pushes would be
+rejected.
+
+1. Set `GITGATE_BRANCH_PREFIX=hermes/`.
+2. Point the workspace repository at the proxy:
+   `git remote set-url origin http://gitgate:8080/<owner>/<repo>.git`.
+3. Put the Hermes containers on the same Docker network as gitgate (`GITGATE_NETWORK`).
+4. Make sure the Hermes containers have no GitHub credentials of their own.
+
+This works for any agent: set the prefix to the one it uses for its branches.
 
 ## Pull requests
 
